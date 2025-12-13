@@ -175,6 +175,7 @@ class SearchDialog(Gtk.Window):
         )
         self._search_entry.connect("search-changed", self._on_search_changed)
         self._search_entry.connect("activate", self._on_search_activate)
+        self._search_entry.connect("stop-search", lambda *args: self.close())
         box.append(self._search_entry)
 
         # Results list
@@ -207,6 +208,16 @@ class SearchDialog(Gtk.Window):
         box.append(self._spinner)
 
         self.set_child(box)
+
+        # Set up Escape key to close dialog
+        controller = Gtk.ShortcutController()
+        self.add_controller(controller)
+        controller.add_shortcut(
+            Gtk.Shortcut(
+                trigger=Gtk.ShortcutTrigger.parse_string("Escape"),
+                action=Gtk.CallbackAction.new(lambda *args: self.close()),
+            )
+        )
 
         # Focus search entry
         self._search_entry.grab_focus()

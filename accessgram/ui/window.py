@@ -476,6 +476,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self._message_rows: dict[int, MessageRow] = {}  # Track message rows by ID
         self._muted_chats: set[int] = set()  # Track muted chat IDs locally
         self._reply_to_message: Any = None  # Message being replied to
+        self._action_target_dialog: Any = None  # Target dialog for context menu actions
 
         # Media manager for downloads/uploads
         self._media_manager = MediaManager(client)
@@ -562,6 +563,7 @@ class MainWindow(Gtk.ApplicationWindow):
         )
         self._chat_listbox.connect("row-activated", self._on_chat_activated)
         self._setup_list_tab_behavior(self._chat_listbox, self._get_chat_list_tab_targets)
+        self._setup_chat_context_menu()
         scrolled.set_child(self._chat_listbox)
         left_box.append(scrolled)
 
@@ -593,22 +595,6 @@ class MainWindow(Gtk.ApplicationWindow):
         self._chat_title.set_hexpand(True)
         self._chat_title.add_css_class("title-2")
         chat_header.append(self._chat_title)
-
-        # Chat actions button
-        actions_button = Gtk.MenuButton()
-        actions_button.set_icon_name("view-more-symbolic")
-        actions_button.update_property(
-            [Gtk.AccessibleProperty.LABEL],
-            ["Chat actions menu"],
-        )
-
-        actions_menu = Gio.Menu()
-        actions_menu.append("Mute chat", "win.mute-chat")
-        actions_menu.append("Unmute chat", "win.unmute-chat")
-        actions_menu.append("Leave chat", "win.leave-chat")
-        actions_menu.append("Delete chat", "win.delete-chat")
-        actions_button.set_menu_model(actions_menu)
-        chat_header.append(actions_button)
 
         self._chat_view.append(chat_header)
 
@@ -768,14 +754,15 @@ class MainWindow(Gtk.ApplicationWindow):
         def on_key_pressed(ctrl, keyval, keycode, state):
             from gi.repository import Gdk
 
-            if keyval == Gdk.KEY_Tab:
+            # Shift+Tab sends ISO_Left_Tab, regular Tab sends KEY_Tab
+            if keyval == Gdk.KEY_ISO_Left_Tab:
                 next_widget, prev_widget = get_targets()
-                shift_held = state & Gdk.ModifierType.SHIFT_MASK
-
-                if shift_held and prev_widget:
+                if prev_widget:
                     prev_widget.grab_focus()
                     return True
-                elif not shift_held and next_widget:
+            elif keyval == Gdk.KEY_Tab:
+                next_widget, prev_widget = get_targets()
+                if next_widget:
                     next_widget.grab_focus()
                     return True
 
@@ -814,6 +801,85 @@ class MainWindow(Gtk.ApplicationWindow):
         prev_widget = self._chat_listbox
 
         return next_widget, prev_widget
+
+    def _setup_chat_context_menu(self) -> None:
+        """Set up context menu for chat list items."""
+        from gi.repository import Gdk
+
+        # Track which dialog the context menu is targeting
+        self._context_menu_dialog = None
+        self._chat_context_menu = None
+
+        # Create the menu model (shared across all context menu instances)
+        self._chat_context_menu_model = Gio.Menu()
+        self._chat_context_menu_model.append("Mute chat", "win.mute-chat")
+        self._chat_context_menu_model.append("Unmute chat", "win.unmute-chat")
+        self._chat_context_menu_model.append("Leave chat", "win.leave-chat")
+        self._chat_context_menu_model.append("Delete chat", "win.delete-chat")
+
+        # Right-click gesture
+        click_gesture = Gtk.GestureClick()
+        click_gesture.set_button(Gdk.BUTTON_SECONDARY)
+        click_gesture.connect("pressed", self._on_chat_context_menu_click)
+        self._chat_listbox.add_controller(click_gesture)
+
+        # Keyboard controller for F10 and Menu key
+        key_controller = Gtk.EventControllerKey()
+        key_controller.connect("key-pressed", self._on_chat_context_menu_key)
+        self._chat_listbox.add_controller(key_controller)
+
+    def _show_chat_context_menu(self, row: Gtk.ListBoxRow) -> None:
+        """Show context menu for a chat row."""
+        if not hasattr(row, "dialog"):
+            return
+
+        # Store the target dialog for actions
+        self._context_menu_dialog = row.dialog
+
+        # Clean up previous popover if it exists
+        if self._chat_context_menu is not None:
+            self._chat_context_menu.unparent()
+
+        # Create new popover parented to this row
+        self._chat_context_menu = Gtk.PopoverMenu.new_from_model(
+            self._chat_context_menu_model
+        )
+        self._chat_context_menu.set_parent(row)
+        self._chat_context_menu.set_has_arrow(False)
+        self._chat_context_menu.connect("closed", self._on_context_menu_closed)
+        self._chat_context_menu.popup()
+
+    def _on_context_menu_closed(self, popover: Gtk.PopoverMenu) -> None:
+        """Clear context menu target when menu closes."""
+        self._context_menu_dialog = None
+
+    def _on_chat_context_menu_click(
+        self, gesture: Gtk.GestureClick, n_press: int, x: float, y: float
+    ) -> None:
+        """Handle right-click on chat list."""
+        row = self._chat_listbox.get_row_at_y(int(y))
+        if row is not None:
+            self._show_chat_context_menu(row)
+
+    def _on_chat_context_menu_key(
+        self, controller: Gtk.EventControllerKey, keyval: int, keycode: int, state: int
+    ) -> bool:
+        """Handle keyboard shortcuts for context menu (F10, Menu key)."""
+        from gi.repository import Gdk
+
+        if keyval in (Gdk.KEY_F10, Gdk.KEY_Menu):
+            row = self._chat_listbox.get_selected_row()
+            if row is not None:
+                self._show_chat_context_menu(row)
+                return True
+        return False
+
+    def _get_context_menu_target(self) -> Any:
+        """Get the dialog that context menu actions should target.
+
+        Returns the context menu target if set, otherwise the current dialog.
+        """
+        return self._context_menu_dialog or self._current_dialog
 
     def _setup_shortcuts(self) -> None:
         """Set up keyboard shortcuts."""
@@ -1480,37 +1546,40 @@ class MainWindow(Gtk.ApplicationWindow):
         logger.exception("Failed to send voice message: %s", error)
 
     def _on_mute_chat(self, action: Gio.SimpleAction, param: None) -> None:
-        """Mute the current chat."""
-        if not self._current_dialog:
+        """Mute the target chat."""
+        target = self._get_context_menu_target()
+        if not target:
             return
 
-        chat_name = self._current_dialog.name or "this chat"
+        chat_name = target.name or "this chat"
+        chat_id = target.id
         create_task_with_callback(
-            self._client.mute_chat(self._current_dialog.entity, mute=True),
-            lambda success: self._on_mute_complete(success, chat_name, True),
+            self._client.mute_chat(target.entity, mute=True),
+            lambda success: self._on_mute_complete(success, chat_name, chat_id, True),
             lambda error: self._on_mute_error(error, True),
         )
 
     def _on_unmute_chat(self, action: Gio.SimpleAction, param: None) -> None:
-        """Unmute the current chat."""
-        if not self._current_dialog:
+        """Unmute the target chat."""
+        target = self._get_context_menu_target()
+        if not target:
             return
 
-        chat_name = self._current_dialog.name or "this chat"
+        chat_name = target.name or "this chat"
+        chat_id = target.id
         create_task_with_callback(
-            self._client.mute_chat(self._current_dialog.entity, mute=False),
-            lambda success: self._on_mute_complete(success, chat_name, False),
+            self._client.mute_chat(target.entity, mute=False),
+            lambda success: self._on_mute_complete(success, chat_name, chat_id, False),
             lambda error: self._on_mute_error(error, False),
         )
 
-    def _on_mute_complete(self, success: bool, chat_name: str, muted: bool) -> None:
+    def _on_mute_complete(self, success: bool, chat_name: str, chat_id: int, muted: bool) -> None:
         """Handle mute/unmute completion."""
         if success:
-            if self._current_dialog:
-                if muted:
-                    self._muted_chats.add(self._current_dialog.id)
-                else:
-                    self._muted_chats.discard(self._current_dialog.id)
+            if muted:
+                self._muted_chats.add(chat_id)
+            else:
+                self._muted_chats.discard(chat_id)
 
             action = "muted" if muted else "unmuted"
             self._announcer.announce(f"{chat_name} {action}")
@@ -1525,11 +1594,14 @@ class MainWindow(Gtk.ApplicationWindow):
         logger.exception("Failed to %s chat: %s", action, error)
 
     def _on_leave_chat(self, action: Gio.SimpleAction, param: None) -> None:
-        """Leave current chat (group/channel)."""
-        if not self._current_dialog:
+        """Leave target chat (group/channel)."""
+        target = self._get_context_menu_target()
+        if not target:
             return
 
-        chat_name = self._current_dialog.name or "this chat"
+        # Store target for use in confirmation callback
+        self._action_target_dialog = target
+        chat_name = target.name or "this chat"
 
         # Create confirmation dialog
         dialog = Gtk.AlertDialog()
@@ -1548,49 +1620,51 @@ class MainWindow(Gtk.ApplicationWindow):
             if response == 1:  # "Leave" button
                 self._do_leave_chat()
         except GLib.Error:
-            pass  # User cancelled
+            self._action_target_dialog = None  # Clear on cancel
 
     def _do_leave_chat(self) -> None:
         """Perform the leave chat action."""
-        if not self._current_dialog:
+        target = self._action_target_dialog
+        if not target:
             return
 
-        chat_name = self._current_dialog.name or "chat"
+        chat_name = target.name or "chat"
         self._announcer.announce(f"Leaving {chat_name}")
 
         create_task_with_callback(
-            self._client.delete_dialog(self._current_dialog.entity, revoke=False),
-            lambda _: self._on_chat_left(),
+            self._client.delete_dialog(target.entity, revoke=False),
+            lambda _: self._on_chat_left(target),
             self._on_leave_chat_error,
         )
 
-    def _on_chat_left(self) -> None:
+    def _on_chat_left(self, target: Any) -> None:
         """Handle successful leave."""
-        chat_name = self._current_dialog.name if self._current_dialog else "chat"
+        chat_name = target.name if target else "chat"
+        dialog_id = target.id
 
         # Remove from dialogs list
-        if self._current_dialog:
-            dialog_id = self._current_dialog.id
-            self._dialogs = [d for d in self._dialogs if d.id != dialog_id]
+        self._dialogs = [d for d in self._dialogs if d.id != dialog_id]
 
-            # Remove from UI
-            row = self._dialog_rows.get(dialog_id)
-            if row:
-                self._chat_listbox.remove(row)
-                del self._dialog_rows[dialog_id]
+        # Remove from UI
+        row = self._dialog_rows.get(dialog_id)
+        if row:
+            self._chat_listbox.remove(row)
+            del self._dialog_rows[dialog_id]
 
-        # Clear current chat view
-        self._current_dialog = None
-        self._placeholder.set_visible(True)
-        self._chat_view.set_visible(False)
+        # Clear current chat view if this was the open chat
+        if self._current_dialog and self._current_dialog.id == dialog_id:
+            self._current_dialog = None
+            self._placeholder.set_visible(True)
+            self._chat_view.set_visible(False)
 
-        # Clear messages
-        while True:
-            row = self._messages_listbox.get_first_child()
-            if row is None:
-                break
-            self._messages_listbox.remove(row)
+            # Clear messages
+            while True:
+                row = self._messages_listbox.get_first_child()
+                if row is None:
+                    break
+                self._messages_listbox.remove(row)
 
+        self._action_target_dialog = None
         self._announcer.announce(f"Left {chat_name}")
         self._chat_listbox.grab_focus()
 
@@ -1600,11 +1674,14 @@ class MainWindow(Gtk.ApplicationWindow):
         logger.exception("Failed to leave chat: %s", error)
 
     def _on_delete_chat(self, action: Gio.SimpleAction, param: None) -> None:
-        """Delete current chat (private conversation)."""
-        if not self._current_dialog:
+        """Delete target chat (private conversation)."""
+        target = self._get_context_menu_target()
+        if not target:
             return
 
-        chat_name = self._current_dialog.name or "this chat"
+        # Store target for use in confirmation callback
+        self._action_target_dialog = target
+        chat_name = target.name or "this chat"
 
         # Create confirmation dialog
         dialog = Gtk.AlertDialog()
@@ -1623,49 +1700,51 @@ class MainWindow(Gtk.ApplicationWindow):
             if response == 1:  # "Delete" button
                 self._do_delete_chat()
         except GLib.Error:
-            pass  # User cancelled
+            self._action_target_dialog = None  # Clear on cancel
 
     def _do_delete_chat(self) -> None:
         """Perform the delete chat action."""
-        if not self._current_dialog:
+        target = self._action_target_dialog
+        if not target:
             return
 
-        chat_name = self._current_dialog.name or "chat"
+        chat_name = target.name or "chat"
         self._announcer.announce(f"Deleting conversation with {chat_name}")
 
         create_task_with_callback(
-            self._client.delete_dialog(self._current_dialog.entity, revoke=True),
-            lambda _: self._on_chat_deleted(),
+            self._client.delete_dialog(target.entity, revoke=True),
+            lambda _: self._on_chat_deleted(target),
             self._on_delete_chat_error,
         )
 
-    def _on_chat_deleted(self) -> None:
+    def _on_chat_deleted(self, target: Any) -> None:
         """Handle successful delete."""
-        chat_name = self._current_dialog.name if self._current_dialog else "chat"
+        chat_name = target.name if target else "chat"
+        dialog_id = target.id
 
         # Remove from dialogs list
-        if self._current_dialog:
-            dialog_id = self._current_dialog.id
-            self._dialogs = [d for d in self._dialogs if d.id != dialog_id]
+        self._dialogs = [d for d in self._dialogs if d.id != dialog_id]
 
-            # Remove from UI
-            row = self._dialog_rows.get(dialog_id)
-            if row:
-                self._chat_listbox.remove(row)
-                del self._dialog_rows[dialog_id]
+        # Remove from UI
+        row = self._dialog_rows.get(dialog_id)
+        if row:
+            self._chat_listbox.remove(row)
+            del self._dialog_rows[dialog_id]
 
-        # Clear current chat view
-        self._current_dialog = None
-        self._placeholder.set_visible(True)
-        self._chat_view.set_visible(False)
+        # Clear current chat view if this was the open chat
+        if self._current_dialog and self._current_dialog.id == dialog_id:
+            self._current_dialog = None
+            self._placeholder.set_visible(True)
+            self._chat_view.set_visible(False)
 
-        # Clear messages
-        while True:
-            row = self._messages_listbox.get_first_child()
-            if row is None:
-                break
-            self._messages_listbox.remove(row)
+            # Clear messages
+            while True:
+                row = self._messages_listbox.get_first_child()
+                if row is None:
+                    break
+                self._messages_listbox.remove(row)
 
+        self._action_target_dialog = None
         self._announcer.announce(f"Deleted conversation with {chat_name}")
         self._chat_listbox.grab_focus()
 
