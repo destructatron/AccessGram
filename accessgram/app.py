@@ -121,7 +121,7 @@ class AccessGramApplication(Gtk.Application):
             program_name="AccessGram",
             version="0.1.0",
             comments="An accessible Telegram client for Linux",
-            website="https://github.com/accessgram/accessgram",
+            website="https://github.com/destructatron/AccessGram",
             license_type=Gtk.License.MIT_X11,
             authors=["AccessGram Contributors"],
         )
