@@ -1,0 +1,11 @@
+# AccessGram Python Dependencies
+# Install with: pip install -r requirements.txt
+
+# Telegram client library (pure Python MTProto implementation)
+Telethon>=1.42.0
+
+# GTK4 Python bindings (also requires system package: pygobject/python3-gi)
+PyGObject>=3.50.0
+
+# Optional: Faster cryptography for Telethon (recommended)
+cryptg>=0.4
