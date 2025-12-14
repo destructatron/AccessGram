@@ -31,14 +31,16 @@ logger = logging.getLogger(__name__)
 class ChatRow(Gtk.ListBoxRow):
     """A row in the chat list representing a dialog."""
 
-    def __init__(self, dialog: Any) -> None:
+    def __init__(self, dialog: Any, muted: bool = False) -> None:
         """Initialize a chat row.
 
         Args:
             dialog: The Telethon Dialog object.
+            muted: Whether the chat is muted.
         """
         super().__init__()
         self.dialog = dialog
+        self._muted = muted
         self._build_ui()
         self._update_accessibility()
 
@@ -82,6 +84,14 @@ class ChatRow(Gtk.ListBoxRow):
             time_label.add_css_class("dim-label")
             time_label.add_css_class("caption")
             right_box.append(time_label)
+
+        # Muted indicator
+        self._muted_label = Gtk.Label(label="(muted)")
+        self._muted_label.add_css_class("dim-label")
+        self._muted_label.add_css_class("caption")
+        self._muted_label.set_halign(Gtk.Align.END)
+        self._muted_label.set_visible(self._muted)
+        right_box.append(self._muted_label)
 
         # Unread count badge (always create, hide if 0)
         self._unread_label = Gtk.Label(label=str(self.dialog.unread_count) if self.dialog.unread_count else "")
@@ -135,6 +145,9 @@ class ChatRow(Gtk.ListBoxRow):
         """Update accessible properties."""
         parts = [self.dialog.name or "Unknown chat"]
 
+        if self._muted:
+            parts.append("muted")
+
         if self.dialog.unread_count > 0:
             parts.append(f"{self.dialog.unread_count} unread messages")
 
@@ -146,6 +159,12 @@ class ChatRow(Gtk.ListBoxRow):
             [Gtk.AccessibleProperty.LABEL],
             [accessible_label],
         )
+
+    def set_muted(self, muted: bool) -> None:
+        """Set the muted state of this chat row."""
+        self._muted = muted
+        self._muted_label.set_visible(muted)
+        self._update_accessibility()
 
     def update_dialog(self, dialog: Any) -> None:
         """Update the row with new dialog data."""
@@ -720,15 +739,10 @@ class MainWindow(Gtk.ApplicationWindow):
         mark_read_action.connect("activate", self._on_mark_as_read)
         self.add_action(mark_read_action)
 
-        # Mute chat action
-        mute_action = Gio.SimpleAction.new("mute-chat", None)
-        mute_action.connect("activate", self._on_mute_chat)
-        self.add_action(mute_action)
-
-        # Unmute chat action
-        unmute_action = Gio.SimpleAction.new("unmute-chat", None)
-        unmute_action.connect("activate", self._on_unmute_chat)
-        self.add_action(unmute_action)
+        # Toggle mute action
+        toggle_mute_action = Gio.SimpleAction.new("toggle-mute", None)
+        toggle_mute_action.connect("activate", self._on_toggle_mute)
+        self.add_action(toggle_mute_action)
 
         # Leave chat action
         leave_action = Gio.SimpleAction.new("leave-chat", None)
@@ -815,14 +829,6 @@ class MainWindow(Gtk.ApplicationWindow):
         self._context_menu_dialog = None
         self._chat_context_menu = None
 
-        # Create the menu model (shared across all context menu instances)
-        self._chat_context_menu_model = Gio.Menu()
-        self._chat_context_menu_model.append("Mark as read", "win.mark-as-read")
-        self._chat_context_menu_model.append("Mute chat", "win.mute-chat")
-        self._chat_context_menu_model.append("Unmute chat", "win.unmute-chat")
-        self._chat_context_menu_model.append("Leave chat", "win.leave-chat")
-        self._chat_context_menu_model.append("Delete chat", "win.delete-chat")
-
         # Right-click gesture
         click_gesture = Gtk.GestureClick()
         click_gesture.set_button(Gdk.BUTTON_SECONDARY)
@@ -833,6 +839,21 @@ class MainWindow(Gtk.ApplicationWindow):
         key_controller = Gtk.EventControllerKey()
         key_controller.connect("key-pressed", self._on_chat_context_menu_key)
         self._chat_listbox.add_controller(key_controller)
+
+    def _build_chat_context_menu_model(self, dialog: Any) -> Gio.Menu:
+        """Build context menu model for a specific dialog."""
+        menu = Gio.Menu()
+        menu.append("Mark as read", "win.mark-as-read")
+
+        # Show mute or unmute based on current state
+        if dialog.id in self._muted_chats:
+            menu.append("Unmute chat", "win.toggle-mute")
+        else:
+            menu.append("Mute chat", "win.toggle-mute")
+
+        menu.append("Leave chat", "win.leave-chat")
+        menu.append("Delete chat", "win.delete-chat")
+        return menu
 
     def _show_chat_context_menu(self, row: Gtk.ListBoxRow) -> None:
         """Show context menu for a chat row."""
@@ -846,10 +867,11 @@ class MainWindow(Gtk.ApplicationWindow):
         if self._chat_context_menu is not None:
             self._chat_context_menu.unparent()
 
+        # Create menu model with correct mute/unmute label
+        menu_model = self._build_chat_context_menu_model(row.dialog)
+
         # Create new popover parented to this row
-        self._chat_context_menu = Gtk.PopoverMenu.new_from_model(
-            self._chat_context_menu_model
-        )
+        self._chat_context_menu = Gtk.PopoverMenu.new_from_model(menu_model)
         self._chat_context_menu.set_parent(row)
         self._chat_context_menu.set_has_arrow(False)
         self._chat_context_menu.connect("closed", self._on_context_menu_closed)
@@ -939,6 +961,8 @@ class MainWindow(Gtk.ApplicationWindow):
 
     async def load_dialogs(self) -> None:
         """Load the chat list."""
+        import time
+
         logger.info("Loading dialogs...")
         self._dialogs = await self._client.get_dialogs(limit=None)
 
@@ -949,10 +973,27 @@ class MainWindow(Gtk.ApplicationWindow):
                 break
             self._chat_listbox.remove(row)
         self._dialog_rows.clear()
+        self._muted_chats.clear()
+
+        # Check mute status from Telegram's notify_settings
+        current_time = time.time()
+        for dialog in self._dialogs:
+            try:
+                notify_settings = dialog.dialog.notify_settings
+                if notify_settings and notify_settings.mute_until:
+                    # mute_until could be datetime or timestamp
+                    mute_until = notify_settings.mute_until
+                    if hasattr(mute_until, 'timestamp'):
+                        mute_until = mute_until.timestamp()
+                    if mute_until > current_time:
+                        self._muted_chats.add(dialog.id)
+            except (AttributeError, TypeError):
+                pass
 
         # Add dialog rows
         for dialog in self._dialogs:
-            row = ChatRow(dialog)
+            muted = dialog.id in self._muted_chats
+            row = ChatRow(dialog, muted=muted)
             self._chat_listbox.append(row)
             self._dialog_rows[dialog.id] = row
 
@@ -1592,32 +1633,21 @@ class MainWindow(Gtk.ApplicationWindow):
         self._announcer.announce(f"Failed to mark {chat_name} as read: {error}")
         logger.exception("Failed to mark chat as read: %s", error)
 
-    def _on_mute_chat(self, action: Gio.SimpleAction, param: None) -> None:
-        """Mute the target chat."""
+    def _on_toggle_mute(self, action: Gio.SimpleAction, param: None) -> None:
+        """Toggle mute state for the target chat."""
         target = self._get_context_menu_target()
         if not target:
             return
 
         chat_name = target.name or "this chat"
         chat_id = target.id
+        # Check current state and toggle
+        currently_muted = chat_id in self._muted_chats
+        new_mute_state = not currently_muted
         create_task_with_callback(
-            self._client.mute_chat(target.entity, mute=True),
-            lambda success: self._on_mute_complete(success, chat_name, chat_id, True),
-            lambda error: self._on_mute_error(error, True),
-        )
-
-    def _on_unmute_chat(self, action: Gio.SimpleAction, param: None) -> None:
-        """Unmute the target chat."""
-        target = self._get_context_menu_target()
-        if not target:
-            return
-
-        chat_name = target.name or "this chat"
-        chat_id = target.id
-        create_task_with_callback(
-            self._client.mute_chat(target.entity, mute=False),
-            lambda success: self._on_mute_complete(success, chat_name, chat_id, False),
-            lambda error: self._on_mute_error(error, False),
+            self._client.mute_chat(target.entity, mute=new_mute_state),
+            lambda success: self._on_mute_complete(success, chat_name, chat_id, new_mute_state),
+            lambda error: self._on_mute_error(error, new_mute_state),
         )
 
     def _on_mute_complete(self, success: bool, chat_name: str, chat_id: int, muted: bool) -> None:
@@ -1627,6 +1657,11 @@ class MainWindow(Gtk.ApplicationWindow):
                 self._muted_chats.add(chat_id)
             else:
                 self._muted_chats.discard(chat_id)
+
+            # Update the row's muted indicator
+            row = self._dialog_rows.get(chat_id)
+            if row:
+                row.set_muted(muted)
 
             action = "muted" if muted else "unmuted"
             self._announcer.announce(f"{chat_name} {action}")
