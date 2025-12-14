@@ -107,11 +107,11 @@ class AccessGramClient:
     # Dialog (Chat List) Operations
     # =========================================================================
 
-    async def get_dialogs(self, limit: int = 100) -> list[Dialog]:
+    async def get_dialogs(self, limit: int | None = None) -> list[Dialog]:
         """Get list of all dialogs (chats).
 
         Args:
-            limit: Maximum number of dialogs to fetch.
+            limit: Maximum number of dialogs to fetch (None for all).
 
         Returns:
             List of Dialog objects.

@@ -931,7 +931,7 @@ class MainWindow(Gtk.ApplicationWindow):
     async def load_dialogs(self) -> None:
         """Load the chat list."""
         logger.info("Loading dialogs...")
-        self._dialogs = await self._client.get_dialogs(limit=self._config.max_messages_to_load)
+        self._dialogs = await self._client.get_dialogs(limit=None)
 
         # Clear existing rows
         while True:
