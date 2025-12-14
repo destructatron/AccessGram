@@ -715,6 +715,11 @@ class MainWindow(Gtk.ApplicationWindow):
 
     def _setup_actions(self) -> None:
         """Set up window-level actions."""
+        # Mark as read action
+        mark_read_action = Gio.SimpleAction.new("mark-as-read", None)
+        mark_read_action.connect("activate", self._on_mark_as_read)
+        self.add_action(mark_read_action)
+
         # Mute chat action
         mute_action = Gio.SimpleAction.new("mute-chat", None)
         mute_action.connect("activate", self._on_mute_chat)
@@ -812,6 +817,7 @@ class MainWindow(Gtk.ApplicationWindow):
 
         # Create the menu model (shared across all context menu instances)
         self._chat_context_menu_model = Gio.Menu()
+        self._chat_context_menu_model.append("Mark as read", "win.mark-as-read")
         self._chat_context_menu_model.append("Mute chat", "win.mute-chat")
         self._chat_context_menu_model.append("Unmute chat", "win.unmute-chat")
         self._chat_context_menu_model.append("Leave chat", "win.leave-chat")
@@ -850,8 +856,11 @@ class MainWindow(Gtk.ApplicationWindow):
         self._chat_context_menu.popup()
 
     def _on_context_menu_closed(self, popover: Gtk.PopoverMenu) -> None:
-        """Clear context menu target when menu closes."""
-        self._context_menu_dialog = None
+        """Handle context menu close."""
+        # Don't clear _context_menu_dialog here - the action handlers
+        # need it and they run after the menu closes. It gets cleared
+        # when the next menu opens in _show_chat_context_menu.
+        pass
 
     def _on_chat_context_menu_click(
         self, gesture: Gtk.GestureClick, n_press: int, x: float, y: float
@@ -1544,6 +1553,44 @@ class MainWindow(Gtk.ApplicationWindow):
         """Handle voice message send error."""
         self._announcer.announce(f"Failed to send voice message: {error}")
         logger.exception("Failed to send voice message: %s", error)
+
+    def _on_mark_as_read(self, action: Gio.SimpleAction, param: None) -> None:
+        """Mark the target chat as read."""
+        target = self._get_context_menu_target()
+        if not target:
+            return
+
+        chat_name = target.name or "this chat"
+        chat_id = target.id
+        # Pass the last message to mark all messages up to it as read
+        last_message = target.message if hasattr(target, "message") else None
+        create_task_with_callback(
+            self._client.mark_read(target.entity, last_message),
+            lambda result: self._on_mark_read_complete(result, chat_name, chat_id, target),
+            lambda error: self._on_mark_read_error(error, chat_name),
+        )
+
+    def _on_mark_read_complete(
+        self, result: Any, chat_name: str, chat_id: int, dialog: Any
+    ) -> None:
+        """Handle mark as read completion."""
+        if result:
+            # Update the dialog's unread count
+            dialog.unread_count = 0
+
+            # Update the UI
+            row = self._dialog_rows.get(chat_id)
+            if row:
+                row.update_dialog(dialog)
+
+            self._announcer.announce(f"{chat_name} marked as read")
+        else:
+            self._announcer.announce(f"Failed to mark {chat_name} as read")
+
+    def _on_mark_read_error(self, error: Exception, chat_name: str) -> None:
+        """Handle mark as read error."""
+        self._announcer.announce(f"Failed to mark {chat_name} as read: {error}")
+        logger.exception("Failed to mark chat as read: %s", error)
 
     def _on_mute_chat(self, action: Gio.SimpleAction, param: None) -> None:
         """Mute the target chat."""
