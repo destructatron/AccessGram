@@ -5,6 +5,7 @@ and message view area.
 """
 
 import logging
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,7 @@ from gi.repository import Gio, GLib, Gtk
 from accessgram.accessibility.announcer import ScreenReaderAnnouncer
 from accessgram.core.client import AccessGramClient
 from accessgram.core.media import MediaManager
+from accessgram.ui.profile_dialog import ProfileDialog
 from accessgram.ui.search_dialog import SearchDialog
 from accessgram.ui.widgets.media_download import MediaDownloadWidget
 from accessgram.ui.widgets.voice_player import VoicePlayerWidget
@@ -631,6 +633,7 @@ class MainWindow(Gtk.ApplicationWindow):
         )
         self._messages_listbox.connect("row-activated", self._on_message_activated)
         self._setup_list_tab_behavior(self._messages_listbox, self._get_messages_list_tab_targets)
+        self._setup_message_context_menu()
         msg_scrolled.set_child(self._messages_listbox)
         self._chat_view.append(msg_scrolled)
 
@@ -753,6 +756,16 @@ class MainWindow(Gtk.ApplicationWindow):
         delete_action = Gio.SimpleAction.new("delete-chat", None)
         delete_action.connect("activate", self._on_delete_chat)
         self.add_action(delete_action)
+
+        # Reply to message action
+        reply_action = Gio.SimpleAction.new("reply-to-message", None)
+        reply_action.connect("activate", self._on_reply_to_message)
+        self.add_action(reply_action)
+
+        # View sender profile action
+        view_profile_action = Gio.SimpleAction.new("view-sender-profile", None)
+        view_profile_action.connect("activate", self._on_view_sender_profile)
+        self.add_action(view_profile_action)
 
     def _setup_list_tab_behavior(
         self,
@@ -911,6 +924,78 @@ class MainWindow(Gtk.ApplicationWindow):
         Returns the context menu target if set, otherwise the current dialog.
         """
         return self._context_menu_dialog or self._current_dialog
+
+    def _setup_message_context_menu(self) -> None:
+        """Set up context menu for message list items."""
+        from gi.repository import Gdk
+
+        # Track which message the context menu is targeting
+        self._context_menu_message = None
+        self._message_context_menu = None
+
+        # Right-click gesture
+        click_gesture = Gtk.GestureClick()
+        click_gesture.set_button(Gdk.BUTTON_SECONDARY)
+        click_gesture.connect("pressed", self._on_message_context_menu_click)
+        self._messages_listbox.add_controller(click_gesture)
+
+        # Keyboard controller for F10 and Menu key
+        key_controller = Gtk.EventControllerKey()
+        key_controller.connect("key-pressed", self._on_message_context_menu_key)
+        self._messages_listbox.add_controller(key_controller)
+
+    def _build_message_context_menu_model(self, message: Any) -> Gio.Menu:
+        """Build context menu model for a message."""
+        menu = Gio.Menu()
+        menu.append("Reply", "win.reply-to-message")
+
+        # Only show "View profile" for messages from other users
+        if not message.out and message.sender:
+            menu.append("View sender profile", "win.view-sender-profile")
+
+        return menu
+
+    def _show_message_context_menu(self, row: Gtk.ListBoxRow) -> None:
+        """Show context menu for a message row."""
+        if not hasattr(row, "message"):
+            return
+
+        # Store the target message for actions
+        self._context_menu_message = row.message
+
+        # Clean up previous popover if it exists
+        if self._message_context_menu is not None:
+            self._message_context_menu.unparent()
+
+        # Create menu model
+        menu_model = self._build_message_context_menu_model(row.message)
+
+        # Create new popover parented to this row
+        self._message_context_menu = Gtk.PopoverMenu.new_from_model(menu_model)
+        self._message_context_menu.set_parent(row)
+        self._message_context_menu.set_has_arrow(False)
+        self._message_context_menu.popup()
+
+    def _on_message_context_menu_click(
+        self, gesture: Gtk.GestureClick, n_press: int, x: float, y: float
+    ) -> None:
+        """Handle right-click on message list."""
+        row = self._messages_listbox.get_row_at_y(int(y))
+        if row is not None:
+            self._show_message_context_menu(row)
+
+    def _on_message_context_menu_key(
+        self, controller: Gtk.EventControllerKey, keyval: int, keycode: int, state: int
+    ) -> bool:
+        """Handle keyboard shortcuts for message context menu (F10, Menu key)."""
+        from gi.repository import Gdk
+
+        if keyval in (Gdk.KEY_F10, Gdk.KEY_Menu):
+            row = self._messages_listbox.get_selected_row()
+            if row is not None:
+                self._show_message_context_menu(row)
+                return True
+        return False
 
     def _setup_shortcuts(self) -> None:
         """Set up keyboard shortcuts."""
@@ -1383,8 +1468,13 @@ class MainWindow(Gtk.ApplicationWindow):
             parent=self,
             client=self._client,
             on_select=self._on_search_select,
+            on_view_profile=self._on_search_view_profile,
         )
         dialog.present()
+
+    def _on_search_view_profile(self, entity: Any) -> None:
+        """Handle view profile from search dialog."""
+        self._show_profile_dialog(entity)
 
     def _on_search_select(self, entity: Any) -> None:
         """Handle selection from search dialog."""
@@ -1834,3 +1924,72 @@ class MainWindow(Gtk.ApplicationWindow):
         """Handle delete chat error."""
         self._announcer.announce(f"Failed to delete chat: {error}")
         logger.exception("Failed to delete chat: %s", error)
+
+    def _on_reply_to_message(self, action: Gio.SimpleAction, param: None) -> None:
+        """Reply to the selected message from context menu."""
+        message = self._context_menu_message
+        if not message:
+            return
+
+        # Use the same logic as _on_message_activated
+        self._reply_to_message = message
+
+        # Update reply indicator
+        sender = self._get_message_sender_name(message)
+        self._reply_to_label.set_label(f"Replying to {sender}")
+
+        # Set preview text
+        if message.text:
+            preview = message.text[:60]
+            if len(message.text) > 60:
+                preview += "..."
+        elif message.voice:
+            preview = "Voice message"
+        elif message.photo:
+            preview = "Photo"
+        elif message.video:
+            preview = "Video"
+        elif message.document:
+            preview = "Document"
+        else:
+            preview = "Message"
+        self._reply_preview_label.set_label(preview)
+
+        # Show reply indicator
+        self._reply_box.set_visible(True)
+
+        # Focus message entry
+        self._message_entry.grab_focus()
+        self._announcer.announce(f"Replying to {sender}")
+
+    def _on_view_sender_profile(self, action: Gio.SimpleAction, param: None) -> None:
+        """View the profile of the message sender."""
+        message = self._context_menu_message
+        if not message or not message.sender:
+            self._announcer.announce("Cannot view profile for this message")
+            return
+
+        self._show_profile_dialog(message.sender)
+
+    def _show_profile_dialog(
+        self,
+        user: Any,
+        on_message: Callable[[Any], None] | None = None,
+    ) -> None:
+        """Show profile dialog for a user.
+
+        Args:
+            user: The user entity to display.
+            on_message: Optional callback when "Message" is clicked.
+        """
+        def default_on_message(selected_user: Any) -> None:
+            """Default handler for messaging from profile dialog."""
+            self._on_search_select(selected_user)
+
+        dialog = ProfileDialog(
+            parent=self,
+            client=self._client,
+            user=user,
+            on_message=on_message or default_on_message,
+        )
+        dialog.present()

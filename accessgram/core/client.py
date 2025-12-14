@@ -417,6 +417,68 @@ class AccessGramClient:
             return []
         return await self._client.get_messages(chat, limit=limit, search=query)
 
+    async def get_full_user(self, user: Any) -> dict[str, Any]:
+        """Get full user information including bio and phone.
+
+        Args:
+            user: The user entity or ID.
+
+        Returns:
+            Dictionary with user info (name, username, bio, phone, etc.)
+        """
+        if not self._client:
+            return {}
+
+        from telethon.tl.functions.users import GetFullUserRequest
+        from telethon.tl.types import UserFull
+
+        try:
+            result = await self._client(GetFullUserRequest(user))
+            full_user: UserFull = result.full_user
+            user_obj = result.users[0] if result.users else None
+
+            info = {
+                "id": full_user.id,
+                "about": full_user.about or "",
+                "common_chats_count": full_user.common_chats_count,
+                "blocked": full_user.blocked,
+                "phone_calls_available": full_user.phone_calls_available,
+                "video_calls_available": full_user.video_calls_available,
+            }
+
+            if user_obj:
+                info.update({
+                    "first_name": getattr(user_obj, "first_name", "") or "",
+                    "last_name": getattr(user_obj, "last_name", "") or "",
+                    "username": getattr(user_obj, "username", "") or "",
+                    "phone": getattr(user_obj, "phone", "") or "",
+                    "bot": getattr(user_obj, "bot", False),
+                    "verified": getattr(user_obj, "verified", False),
+                    "premium": getattr(user_obj, "premium", False),
+                })
+
+            return info
+        except Exception as e:
+            logger.exception("Failed to get full user info: %s", e)
+            return {}
+
+    async def get_entity(self, entity_id: Any) -> Any:
+        """Get an entity by ID.
+
+        Args:
+            entity_id: The entity ID or username.
+
+        Returns:
+            The entity object or None.
+        """
+        if not self._client:
+            return None
+        try:
+            return await self._client.get_entity(entity_id)
+        except Exception as e:
+            logger.exception("Failed to get entity: %s", e)
+            return None
+
     # =========================================================================
     # Event Handling
     # =========================================================================

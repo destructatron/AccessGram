@@ -12,7 +12,7 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 
-from gi.repository import GLib, Gtk
+from gi.repository import Gio, GLib, Gtk
 
 from accessgram.core.client import AccessGramClient
 from accessgram.utils.async_bridge import create_task_with_callback
@@ -129,6 +129,7 @@ class SearchDialog(Gtk.Window):
         parent: Gtk.Window,
         client: AccessGramClient,
         on_select: Callable[[Any], None],
+        on_view_profile: Callable[[Any], None] | None = None,
     ) -> None:
         """Initialize the search dialog.
 
@@ -136,6 +137,7 @@ class SearchDialog(Gtk.Window):
             parent: Parent window.
             client: Telegram client.
             on_select: Callback when an entity is selected.
+            on_view_profile: Optional callback when "View profile" is selected.
         """
         super().__init__(
             title="Search",
@@ -147,10 +149,13 @@ class SearchDialog(Gtk.Window):
 
         self._client = client
         self._on_select = on_select
+        self._on_view_profile = on_view_profile
         self._search_timeout: int | None = None
         self._results: list[Any] = []
 
         self._build_ui()
+        self._setup_actions()
+        self._setup_context_menu()
         self._update_accessibility()
 
     def _build_ui(self) -> None:
@@ -309,3 +314,98 @@ class SearchDialog(Gtk.Window):
         """Handle result selection."""
         self._on_select(row.entity)
         self.close()
+
+    def _setup_actions(self) -> None:
+        """Set up window-level actions."""
+        # Message action (same as activating)
+        message_action = Gio.SimpleAction.new("message-entity", None)
+        message_action.connect("activate", self._on_message_action)
+        self.add_action(message_action)
+
+        # View profile action
+        view_profile_action = Gio.SimpleAction.new("view-profile", None)
+        view_profile_action.connect("activate", self._on_view_profile_action)
+        self.add_action(view_profile_action)
+
+    def _setup_context_menu(self) -> None:
+        """Set up context menu for search results."""
+        from gi.repository import Gdk
+
+        # Track which entity the context menu is targeting
+        self._context_menu_entity = None
+        self._context_menu = None
+
+        # Right-click gesture
+        click_gesture = Gtk.GestureClick()
+        click_gesture.set_button(Gdk.BUTTON_SECONDARY)
+        click_gesture.connect("pressed", self._on_context_menu_click)
+        self._results_listbox.add_controller(click_gesture)
+
+        # Keyboard controller for F10 and Menu key
+        key_controller = Gtk.EventControllerKey()
+        key_controller.connect("key-pressed", self._on_context_menu_key)
+        self._results_listbox.add_controller(key_controller)
+
+    def _build_context_menu_model(self, entity: Any) -> Gio.Menu:
+        """Build context menu model for an entity."""
+        menu = Gio.Menu()
+        menu.append("Message", "win.message-entity")
+
+        # Only show "View profile" for users (not channels/groups)
+        if hasattr(entity, "first_name"):
+            menu.append("View profile", "win.view-profile")
+
+        return menu
+
+    def _show_context_menu(self, row: SearchResultRow) -> None:
+        """Show context menu for a search result row."""
+        # Store the target entity for actions
+        self._context_menu_entity = row.entity
+
+        # Clean up previous popover if it exists
+        if self._context_menu is not None:
+            self._context_menu.unparent()
+
+        # Create menu model
+        menu_model = self._build_context_menu_model(row.entity)
+
+        # Create new popover parented to this row
+        self._context_menu = Gtk.PopoverMenu.new_from_model(menu_model)
+        self._context_menu.set_parent(row)
+        self._context_menu.set_has_arrow(False)
+        self._context_menu.popup()
+
+    def _on_context_menu_click(
+        self, gesture: Gtk.GestureClick, n_press: int, x: float, y: float
+    ) -> None:
+        """Handle right-click on results list."""
+        row = self._results_listbox.get_row_at_y(int(y))
+        if row is not None:
+            self._show_context_menu(row)
+
+    def _on_context_menu_key(
+        self, controller: Gtk.EventControllerKey, keyval: int, keycode: int, state: int
+    ) -> bool:
+        """Handle keyboard shortcuts for context menu (F10, Menu key)."""
+        from gi.repository import Gdk
+
+        if keyval in (Gdk.KEY_F10, Gdk.KEY_Menu):
+            row = self._results_listbox.get_selected_row()
+            if row is not None:
+                self._show_context_menu(row)
+                return True
+        return False
+
+    def _on_message_action(self, action: Gio.SimpleAction, param: None) -> None:
+        """Handle message action from context menu."""
+        entity = self._context_menu_entity
+        if entity:
+            self._on_select(entity)
+            self.close()
+
+    def _on_view_profile_action(self, action: Gio.SimpleAction, param: None) -> None:
+        """Handle view profile action from context menu."""
+        entity = self._context_menu_entity
+        if entity and self._on_view_profile:
+            self._on_view_profile(entity)
+            self.close()
