@@ -237,6 +237,26 @@ class AccessGramClient:
             voice_note=voice_note,
         )
 
+    async def edit_message(
+        self,
+        chat: Any,
+        message_id: int,
+        text: str,
+    ) -> Message:
+        """Edit a message.
+
+        Args:
+            chat: The chat entity.
+            message_id: The ID of the message to edit.
+            text: The new message text.
+
+        Returns:
+            The edited Message object.
+        """
+        if not self._client:
+            raise RuntimeError("Client not connected")
+        return await self._client.edit_message(chat, message_id, text)
+
     async def delete_messages(
         self,
         chat: Any,

@@ -497,6 +497,7 @@ class MainWindow(Gtk.ApplicationWindow):
         self._message_rows: dict[int, MessageRow] = {}  # Track message rows by ID
         self._muted_chats: set[int] = set()  # Track muted chat IDs locally
         self._reply_to_message: Any = None  # Message being replied to
+        self._editing_message: Any = None  # Message being edited
         self._action_target_dialog: Any = None  # Target dialog for context menu actions
 
         # Media manager for downloads/uploads
@@ -676,6 +677,45 @@ class MainWindow(Gtk.ApplicationWindow):
 
         self._chat_view.append(self._reply_box)
 
+        # Edit indicator (hidden by default)
+        self._edit_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self._edit_box.set_margin_start(12)
+        self._edit_box.set_margin_end(12)
+        self._edit_box.set_margin_top(8)
+        self._edit_box.set_visible(False)
+
+        edit_icon = Gtk.Image.new_from_icon_name("document-edit-symbolic")
+        self._edit_box.append(edit_icon)
+
+        edit_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        edit_info.set_hexpand(True)
+
+        self._edit_label = Gtk.Label(label="Editing message")
+        self._edit_label.set_xalign(0)
+        self._edit_label.add_css_class("dim-label")
+        self._edit_label.add_css_class("caption")
+        edit_info.append(self._edit_label)
+
+        self._edit_preview_label = Gtk.Label()
+        self._edit_preview_label.set_xalign(0)
+        self._edit_preview_label.set_ellipsize(True)
+        edit_info.append(self._edit_preview_label)
+
+        self._edit_box.append(edit_info)
+
+        # Cancel edit button
+        cancel_edit_button = Gtk.Button()
+        cancel_edit_button.set_icon_name("window-close-symbolic")
+        cancel_edit_button.add_css_class("flat")
+        cancel_edit_button.update_property(
+            [Gtk.AccessibleProperty.LABEL],
+            ["Cancel edit"],
+        )
+        cancel_edit_button.connect("clicked", self._on_cancel_edit)
+        self._edit_box.append(cancel_edit_button)
+
+        self._chat_view.append(self._edit_box)
+
         # Compose area
         compose_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         compose_box.set_margin_start(12)
@@ -766,6 +806,20 @@ class MainWindow(Gtk.ApplicationWindow):
         view_profile_action = Gio.SimpleAction.new("view-sender-profile", None)
         view_profile_action.connect("activate", self._on_view_sender_profile)
         self.add_action(view_profile_action)
+
+        # Edit message action
+        edit_message_action = Gio.SimpleAction.new("edit-message", None)
+        edit_message_action.connect("activate", self._on_edit_message)
+        self.add_action(edit_message_action)
+
+        # Delete message actions
+        delete_for_all_action = Gio.SimpleAction.new("delete-message-for-all", None)
+        delete_for_all_action.connect("activate", self._on_delete_message_for_all)
+        self.add_action(delete_for_all_action)
+
+        delete_for_me_action = Gio.SimpleAction.new("delete-message-for-me", None)
+        delete_for_me_action.connect("activate", self._on_delete_message_for_me)
+        self.add_action(delete_for_me_action)
 
     def _setup_list_tab_behavior(
         self,
@@ -952,6 +1006,19 @@ class MainWindow(Gtk.ApplicationWindow):
         # Only show "View profile" for messages from other users
         if not message.out and message.sender:
             menu.append("View sender profile", "win.view-sender-profile")
+
+        # Edit option for own text messages only
+        if message.out and message.text:
+            menu.append("Edit", "win.edit-message")
+
+        # Delete options
+        if message.out:
+            # Own messages can be deleted for everyone
+            menu.append("Delete for everyone", "win.delete-message-for-all")
+            menu.append("Delete for me", "win.delete-message-for-me")
+        else:
+            # Others' messages can only be deleted for self
+            menu.append("Delete for me", "win.delete-message-for-me")
 
         return menu
 
@@ -1287,6 +1354,11 @@ class MainWindow(Gtk.ApplicationWindow):
         if not text or not self._current_dialog:
             return
 
+        # Check if we're in edit mode
+        if self._editing_message:
+            self._do_edit_message(text)
+            return
+
         self._message_entry.set_text("")
         self._message_entry.set_sensitive(False)
 
@@ -1298,6 +1370,61 @@ class MainWindow(Gtk.ApplicationWindow):
             self._on_message_sent,
             self._on_message_error,
         )
+
+    def _do_edit_message(self, new_text: str) -> None:
+        """Send the edited message."""
+        message = self._editing_message
+        if not message or not self._current_dialog:
+            return
+
+        # Don't edit if text hasn't changed
+        if new_text == message.text:
+            self._clear_edit()
+            self._announcer.announce("No changes made")
+            return
+
+        self._message_entry.set_text("")
+        self._message_entry.set_sensitive(False)
+
+        create_task_with_callback(
+            self._client.edit_message(
+                self._current_dialog.entity,
+                message.id,
+                new_text,
+            ),
+            self._on_message_edited,
+            self._on_edit_error,
+        )
+
+    def _on_message_edited(self, edited_message: Any) -> None:
+        """Handle successful message edit."""
+        self._message_entry.set_sensitive(True)
+        self._message_entry.grab_focus()
+
+        original_message = self._editing_message
+        self._clear_edit()
+
+        # Update the message row in the UI
+        if original_message and original_message.id in self._message_rows:
+            old_row = self._message_rows[original_message.id]
+            # Get the index of the old row
+            index = old_row.get_index()
+
+            # Remove old row
+            self._messages_listbox.remove(old_row)
+
+            # Create new row with edited message
+            new_row = MessageRow(edited_message, self._media_manager)
+            self._messages_listbox.insert(new_row, index)
+            self._message_rows[edited_message.id] = new_row
+
+        self._announcer.announce("Message edited")
+
+    def _on_edit_error(self, error: Exception) -> None:
+        """Handle message edit error."""
+        self._message_entry.set_sensitive(True)
+        self._announcer.announce(f"Failed to edit message: {error}")
+        logger.exception("Failed to edit message: %s", error)
 
     async def _send_message_async(self, entity: Any, text: str, reply_to: int | None) -> Any:
         """Send a message with optional reply."""
@@ -1993,3 +2120,105 @@ class MainWindow(Gtk.ApplicationWindow):
             on_message=on_message or default_on_message,
         )
         dialog.present()
+
+    # =========================================================================
+    # Edit Message
+    # =========================================================================
+
+    def _on_edit_message(self, action: Gio.SimpleAction, param: None) -> None:
+        """Enter edit mode for a message."""
+        message = self._context_menu_message
+        if not message or not message.out or not message.text:
+            return
+
+        # Clear any reply state first
+        self._clear_reply()
+
+        # Set editing state
+        self._editing_message = message
+
+        # Show edit indicator
+        preview = message.text[:60]
+        if len(message.text) > 60:
+            preview += "..."
+        self._edit_preview_label.set_label(preview)
+        self._edit_box.set_visible(True)
+
+        # Populate message entry with current text
+        self._message_entry.set_text(message.text)
+        self._message_entry.grab_focus()
+
+        self._announcer.announce("Editing message")
+
+    def _on_cancel_edit(self, button: Gtk.Button) -> None:
+        """Cancel editing a message."""
+        self._clear_edit()
+        self._announcer.announce("Edit cancelled")
+        self._message_entry.grab_focus()
+
+    def _clear_edit(self) -> None:
+        """Clear the edit state."""
+        self._editing_message = None
+        self._edit_box.set_visible(False)
+        self._edit_preview_label.set_label("")
+        self._message_entry.set_text("")
+
+    # =========================================================================
+    # Delete Message
+    # =========================================================================
+
+    def _on_delete_message_for_all(self, action: Gio.SimpleAction, param: None) -> None:
+        """Delete message for everyone."""
+        message = self._context_menu_message
+        if not message:
+            return
+
+        self._delete_message(message, revoke=True)
+
+    def _on_delete_message_for_me(self, action: Gio.SimpleAction, param: None) -> None:
+        """Delete message for self only."""
+        message = self._context_menu_message
+        if not message:
+            return
+
+        self._delete_message(message, revoke=False)
+
+    def _delete_message(self, message: Any, revoke: bool) -> None:
+        """Delete a message.
+
+        Args:
+            message: The message to delete.
+            revoke: If True, delete for everyone.
+        """
+        if not self._current_dialog:
+            return
+
+        action_text = "for everyone" if revoke else "for me"
+        self._announcer.announce(f"Deleting message {action_text}")
+
+        create_task_with_callback(
+            self._client.delete_messages(
+                self._current_dialog.entity,
+                [message.id],
+                revoke=revoke,
+            ),
+            lambda _: self._on_message_deleted(message),
+            self._on_message_delete_error,
+        )
+
+    def _on_message_deleted(self, message: Any) -> None:
+        """Handle successful message deletion."""
+        # Remove the message row from the UI
+        for row in list(self._message_rows.values()):
+            if hasattr(row, "message") and row.message.id == message.id:
+                self._messages_listbox.remove(row)
+                if message.id in self._message_rows:
+                    del self._message_rows[message.id]
+                break
+
+        self._announcer.announce("Message deleted")
+
+    def _on_message_delete_error(self, error: Exception) -> None:
+        """Handle message deletion error."""
+        self._announcer.announce(f"Failed to delete message: {error}")
+        logger.exception("Failed to delete message: %s", error)
