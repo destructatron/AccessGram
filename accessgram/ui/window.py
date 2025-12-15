@@ -792,10 +792,14 @@ class MainWindow(Gtk.ApplicationWindow):
         leave_action.connect("activate", self._on_leave_chat)
         self.add_action(leave_action)
 
-        # Delete chat action
-        delete_action = Gio.SimpleAction.new("delete-chat", None)
-        delete_action.connect("activate", self._on_delete_chat)
-        self.add_action(delete_action)
+        # Delete chat actions
+        delete_chat_for_me_action = Gio.SimpleAction.new("delete-chat-for-me", None)
+        delete_chat_for_me_action.connect("activate", self._on_delete_chat_for_me)
+        self.add_action(delete_chat_for_me_action)
+
+        delete_chat_for_both_action = Gio.SimpleAction.new("delete-chat-for-both", None)
+        delete_chat_for_both_action.connect("activate", self._on_delete_chat_for_both)
+        self.add_action(delete_chat_for_both_action)
 
         # Reply to message action
         reply_action = Gio.SimpleAction.new("reply-to-message", None)
@@ -919,7 +923,13 @@ class MainWindow(Gtk.ApplicationWindow):
             menu.append("Mute chat", "win.toggle-mute")
 
         menu.append("Leave chat", "win.leave-chat")
-        menu.append("Delete chat", "win.delete-chat")
+
+        # Delete submenu with options for me/both
+        delete_submenu = Gio.Menu()
+        delete_submenu.append("Delete just for me", "win.delete-chat-for-me")
+        delete_submenu.append("Delete for both", "win.delete-chat-for-both")
+        menu.append_submenu("Delete chat", delete_submenu)
+
         return menu
 
     def _show_chat_context_menu(self, row: Gtk.ListBoxRow) -> None:
@@ -1972,20 +1982,39 @@ class MainWindow(Gtk.ApplicationWindow):
         self._announcer.announce(f"Failed to leave chat: {error}")
         logger.exception("Failed to leave chat: %s", error)
 
-    def _on_delete_chat(self, action: Gio.SimpleAction, param: None) -> None:
-        """Delete target chat (private conversation)."""
+    def _on_delete_chat_for_me(self, action: Gio.SimpleAction, param: None) -> None:
+        """Delete target chat just for me."""
+        self._show_delete_chat_confirmation(revoke=False)
+
+    def _on_delete_chat_for_both(self, action: Gio.SimpleAction, param: None) -> None:
+        """Delete target chat for both parties."""
+        self._show_delete_chat_confirmation(revoke=True)
+
+    def _show_delete_chat_confirmation(self, revoke: bool) -> None:
+        """Show delete chat confirmation dialog."""
         target = self._get_context_menu_target()
         if not target:
             return
 
-        # Store target for use in confirmation callback
+        # Store target and revoke flag for use in confirmation callback
         self._action_target_dialog = target
+        self._delete_chat_revoke = revoke
         chat_name = target.name or "this chat"
 
         # Create confirmation dialog
         dialog = Gtk.AlertDialog()
-        dialog.set_message(f"Delete conversation with {chat_name}?")
-        dialog.set_detail("This will delete the chat history. This action cannot be undone.")
+        if revoke:
+            dialog.set_message(f"Delete conversation with {chat_name} for both?")
+            dialog.set_detail(
+                "This will delete the chat history for you and the other person. "
+                "This action cannot be undone."
+            )
+        else:
+            dialog.set_message(f"Delete conversation with {chat_name}?")
+            dialog.set_detail(
+                "This will delete the chat history just for you. "
+                "The other person will still have the conversation."
+            )
         dialog.set_buttons(["Cancel", "Delete"])
         dialog.set_default_button(0)
         dialog.set_cancel_button(0)
@@ -2000,6 +2029,7 @@ class MainWindow(Gtk.ApplicationWindow):
                 self._do_delete_chat()
         except GLib.Error:
             self._action_target_dialog = None  # Clear on cancel
+            self._delete_chat_revoke = False
 
     def _do_delete_chat(self) -> None:
         """Perform the delete chat action."""
@@ -2007,11 +2037,12 @@ class MainWindow(Gtk.ApplicationWindow):
         if not target:
             return
 
+        revoke = getattr(self, "_delete_chat_revoke", False)
         chat_name = target.name or "chat"
         self._announcer.announce(f"Deleting conversation with {chat_name}")
 
         create_task_with_callback(
-            self._client.delete_dialog(target.entity, revoke=True),
+            self._client.delete_dialog(target.entity, revoke=revoke),
             lambda _: self._on_chat_deleted(target),
             self._on_delete_chat_error,
         )
@@ -2044,11 +2075,14 @@ class MainWindow(Gtk.ApplicationWindow):
                 self._messages_listbox.remove(row)
 
         self._action_target_dialog = None
+        self._delete_chat_revoke = False
         self._announcer.announce(f"Deleted conversation with {chat_name}")
         self._chat_listbox.grab_focus()
 
     def _on_delete_chat_error(self, error: Exception) -> None:
         """Handle delete chat error."""
+        self._action_target_dialog = None
+        self._delete_chat_revoke = False
         self._announcer.announce(f"Failed to delete chat: {error}")
         logger.exception("Failed to delete chat: %s", error)
 
